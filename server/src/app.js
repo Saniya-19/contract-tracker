@@ -16,12 +16,25 @@ const app = express();
 app.use(helmet());
 
 // Cross-Origin Resource Sharing configuration
+// app.use(
+//   cors({
+//     origin: env.CLIENT_URL,
+//     credentials: true,
+//   })
+// );
+
+
+
 app.use(
   cors({
-    origin: env.CLIENT_URL,
+    origin: [
+      env.CLIENT_URL,
+      'https://hoppscotch.io',
+    ],
     credentials: true,
   })
 );
+
 
 // Rate limiting middleware
 const limiter = rateLimit({
