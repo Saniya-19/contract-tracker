@@ -72,6 +72,9 @@ const contractSchema = new mongoose.Schema(
     cancelledAt: {
       type: Date,
     },
+    completedAt: {
+      type: Date,
+    },
     rejectionReason: {
       type: String,
       trim: true,

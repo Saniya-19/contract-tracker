@@ -20,11 +20,15 @@ import {
   rejectContractSchema,
   listContractsQuerySchema,
 } from '../validators/contract.validators.js';
+import milestoneRoutes from './milestone.routes.js';
 
 const router = Router();
 
 // Protect all contract endpoints with JWT authentication
 router.use(authenticate);
+
+// Forward nested milestone routes
+router.use('/:id/milestones', milestoneRoutes);
 
 // Contract CRUD routes
 router.post('/', authorizeRoles('freelancer'), validate(createContractSchema), createContract);

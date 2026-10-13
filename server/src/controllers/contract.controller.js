@@ -1,6 +1,7 @@
 import { ApiError } from '../utils/ApiError.js';
 import { asyncHandler } from '../utils/asyncHandler.js';
 import { Contract } from '../models/Contract.js';
+import { Milestone } from '../models/Milestone.js';
 import { User } from '../models/User.js';
 import { assertTransition } from '../utils/contractStateMachine.js';
 
@@ -109,9 +110,30 @@ export const getContract = asyncHandler(async (req, res) => {
     { path: 'client', select: 'name email' },
   ]);
 
+  const milestones = await Milestone.find({ contract: req.contract._id }).sort({ order: 1 });
+
+  const total = milestones.length;
+  const approved = milestones.filter((m) => m.status === 'approved').length;
+  const paid = milestones.filter((m) => m.status === 'paid').length;
+  const completedCount = approved + paid;
+  const percentComplete = total > 0 ? Math.round((completedCount / total) * 100) : 0;
+
+  const progress = {
+    total,
+    approved,
+    paid,
+    percentComplete,
+  };
+
+  const contractData = {
+    ...contract.toObject(),
+    milestones,
+    progress,
+  };
+
   res.status(200).json({
     success: true,
-    data: contract,
+    data: contractData,
   });
 });
 
@@ -135,6 +157,24 @@ export const updateContract = asyncHandler(async (req, res) => {
 
   if (effectiveStartDate && effectiveEndDate && effectiveEndDate <= effectiveStartDate) {
     throw new ApiError(400, 'End date must be after start date');
+  }
+
+  // If totalAmount is being updated, verify it is not less than existing milestones sum
+  if (req.body.totalAmount !== undefined) {
+    const milestones = await Milestone.find({ contract: req.contract._id });
+    const currentMilestonePaise = milestones.reduce(
+      (sum, m) => sum + Math.round(m.amount * 100),
+      0
+    );
+    const newTotalPaise = Math.round(req.body.totalAmount * 100);
+
+    if (newTotalPaise < currentMilestonePaise) {
+      const milestoneSumFormatted = (currentMilestonePaise / 100).toFixed(2);
+      throw new ApiError(
+        400,
+        `Total amount cannot be less than the sum of existing milestones (${milestoneSumFormatted})`
+      );
+    }
   }
 
   // If client email was updated, re-link client user if registered
@@ -190,7 +230,26 @@ export const sendContract = asyncHandler(async (req, res) => {
 
   assertTransition(req.contract.status, 'pending');
 
-  // TODO Phase 4: require milestones summing to totalAmount before sending
+  const milestones = await Milestone.find({ contract: req.contract._id });
+  if (milestones.length === 0) {
+    throw new ApiError(400, 'Contract must have at least one milestone before sending to client');
+  }
+
+  const milestoneTotalPaise = milestones.reduce(
+    (sum, m) => sum + Math.round(m.amount * 100),
+    0
+  );
+  const contractTotalPaise = Math.round(req.contract.totalAmount * 100);
+
+  if (milestoneTotalPaise !== contractTotalPaise) {
+    const milestoneSumFormatted = (milestoneTotalPaise / 100).toFixed(2);
+    const contractTotalFormatted = (contractTotalPaise / 100).toFixed(2);
+    throw new ApiError(
+      400,
+      `Milestone amounts sum (${milestoneSumFormatted}) must equal contract total amount (${contractTotalFormatted}) before sending`
+    );
+  }
+
   // TODO Phase 9: send email notification to client
   // TODO Phase 6: write activity log
 
