@@ -5,7 +5,8 @@ import { env } from '../config/env.js';
 export const REFRESH_COOKIE_NAME = 'refreshToken';
 
 /**
- * Generate a short-lived JWT access token (15 minutes)
+ * Generate a short-lived JWT access token
+ * Lifetime is controlled by the JWT_ACCESS_EXPIRES_IN env variable (default: 15m)
  * Payload includes user ID and role
  */
 export const generateAccessToken = (user) => {
@@ -16,7 +17,7 @@ export const generateAccessToken = (user) => {
     },
     env.JWT_ACCESS_SECRET,
     {
-      expiresIn: '15m',
+      expiresIn: env.JWT_ACCESS_EXPIRES_IN,
     }
   );
 };

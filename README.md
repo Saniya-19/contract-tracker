@@ -17,12 +17,13 @@ contract-tracker/
 ├── server/
 │   ├── src/
 │   │   ├── config/        (db.js, env.js)
-│   │   ├── controllers/   (auth.controller.js, contract.controller.js)
-│   │   ├── middleware/    (authenticate.js, authorizeRoles.js, errorHandler.js, loadContract.js, notFound.js, validate.js)
-│   │   ├── models/        (Contract.js, User.js)
-│   │   ├── routes/        (index.js, health.routes.js, auth.routes.js, contract.routes.js)
-│   │   ├── utils/         (ApiError.js, asyncHandler.js, contractStateMachine.js, tokens.js)
-│   │   ├── validators/    (auth.validators.js, contract.validators.js)
+│   │   ├── controllers/   (auth.controller.js, contract.controller.js, milestone.controller.js)
+│   │   ├── middleware/    (authenticate.js, authorizeRoles.js, errorHandler.js, loadContract.js, loadMilestone.js, notFound.js, validate.js)
+│   │   ├── models/        (Contract.js, Milestone.js, User.js)
+│   │   ├── routes/        (index.js, health.routes.js, auth.routes.js, contract.routes.js, milestone.routes.js)
+│   │   ├── services/      (contractCompletion.js)
+│   │   ├── utils/         (ApiError.js, asyncHandler.js, contractStateMachine.js, milestoneStateMachine.js, tokens.js)
+│   │   ├── validators/    (auth.validators.js, contract.validators.js, milestone.validators.js)
 │   │   ├── app.js
 │   │   └── server.js
 │   ├── .env.example
@@ -59,6 +60,7 @@ NODE_ENV=development
 MONGO_URI=mongodb://127.0.0.1:27017/contract_tracker
 JWT_ACCESS_SECRET=your_jwt_access_secret_key_here
 JWT_REFRESH_SECRET=your_jwt_refresh_secret_key_here
+JWT_ACCESS_EXPIRES_IN=15m   # optional – defaults to 15m; set to e.g. 4h for local dev
 CLIENT_URL=http://localhost:5173
 ```
 
@@ -662,3 +664,380 @@ Transitions contract from `draft`, `pending`, or `active` to `cancelled`, and re
 - **Error Responses**:
   - `403 Forbidden`: Authenticated freelancer is not the owner.
   - `409 Conflict`: Contract is in a terminal state (`rejected`, `completed`, `cancelled`).
+
+---
+
+## Milestones API Reference
+
+All milestone routes are nested under the `/api/contracts/:id/milestones` prefix and protected by `authenticate` and `loadContract` middleware.
+
+### Milestone State Machine
+
+Milestones progress through an explicit role-based workflow state machine:
+
+```text
+       [ create ] (Freelancer, Draft Contract)
+           │
+           ▼
+        ┌───────┐
+   ┌──► │pending│
+   │    └───────┘
+   │        │
+   │ (start)│ (Freelancer, Contract Active)
+   │        ▼
+   │  ┌───────────┐
+   │  │in_progress│
+   │  └───────────┘
+   │        │
+   │(submit)│ (Freelancer, Contract Active)
+   │        ▼
+   │  ┌─────────┐
+   │  │submitted│
+   │  └─────────┘
+   │   │       │
+(request-      │(approve)
+revision)      │(Client, Contract Active)
+   │           ▼
+┌──────────────────┐  (mark-paid)   ┌────┐
+│revision_requested│ ◄───────────── │paid│ (Auto-completes contract
+└──────────────────┘ (Client,       └────┘  when all milestones paid)
+       │              Contract Active) ▲
+(start)│                               │
+       └───────────────────────────────┘
+```
+
+#### Status Transition Table (Who Can Move What)
+
+| Action | Current Status (`from`) | Target Status (`to`) | Allowed Role | Trigger / Requirements |
+|---|---|---|---|---|
+| `start` | `pending` | `in_progress` | `freelancer` | Starts work. Requires all earlier milestones (lower order) to be `approved` or `paid`. |
+| `start` | `revision_requested` | `in_progress` | `freelancer` | Resumes work after client feedback. Automatically clears `revisionNotes`. |
+| `submit` | `in_progress` | `submitted` | `freelancer` | Submits deliverable for review. Accepts optional `submissionNote`. |
+| `approve` | `submitted` | `approved` | `client` | Client approves deliverables. Records `approvedAt`. |
+| `request-revision` | `submitted` | `revision_requested` | `client` | Client requests changes. Requires `revisionNotes` (min 5 characters). |
+| `mark-paid` | `approved` | `paid` | `client` | Client marks milestone paid. Records `paidAt`, accepts optional `paymentReference`. Automatically transitions contract to `completed` if all milestones are paid. |
+
+#### Core Business Rules:
+1. **Draft Modifications Only**: Adding (`POST /`), editing (`PATCH /:milestoneId`), deleting (`DELETE /:milestoneId`), and reordering (`PUT /reorder`) milestones are allowed **only while the contract status is `"draft"`** and **only by the contract's freelancer**. Otherwise returns `409 Conflict` (or `403 Forbidden`).
+2. **Total Amount Budget Constraint**: The sum of milestone amounts must never exceed the contract `totalAmount`. Any addition or edit that exceeds it returns `400 Bad Request` with a clear message indicating the remaining balance.
+3. **Exact Milestone Sum on Send**: Sending a contract (`POST /contracts/:id/send`) requires at least one milestone and requires the sum of all milestone amounts to equal `totalAmount` exactly (calculated in integer paise).
+4. **Active Contract Requirement**: Milestone workflow actions (`start`, `submit`, `approve`, `request-revision`, `mark-paid`) are allowed **only when the contract status is `"active"`**. Otherwise returns `409 Conflict`.
+5. **Sequential Progression Rule**: A milestone can only be started if **all earlier milestones (lower order) are already in `"approved"` or `"paid"` status**. Otherwise returns `409 Conflict`.
+6. **Revision Notes Lifecycle**: Calling `request-revision` requires non-empty `revisionNotes` (5–1000 characters). When the freelancer calls `start` again, `revisionNotes` are automatically cleared (`null`).
+7. **Concurrency Safety**: All state transitions execute atomically via `findOneAndUpdate` with the expected current status in the filter query. Concurrent requests returning no match yield `409 Conflict`.
+8. **Automatic Contract Completion**: Upon successfully marking the final unpaid milestone as `"paid"`, the system automatically transitions the contract to `"completed"`, records `completedAt`, and validates transition through the contract state machine.
+
+---
+
+### Endpoints Overview
+
+| Method | Endpoint | Allowed Participant | Middleware Stack | Description |
+|---|---|---|---|---|
+| `POST` | `/api/contracts/:id/milestones` | `freelancer` (owner) | `authenticate`, `loadContract`, `validate` | Create milestone (`order = last + 1`) |
+| `GET` | `/api/contracts/:id/milestones` | Participant | `authenticate`, `loadContract` | List contract milestones sorted by order |
+| `PUT` | `/api/contracts/:id/milestones/reorder` | `freelancer` (owner) | `authenticate`, `loadContract`, `validate` | Reorder milestones `{ order: [ids] }` |
+| `PATCH` | `/api/contracts/:id/milestones/:milestoneId` | `freelancer` (owner) | `authenticate`, `loadContract`, `loadMilestone`, `validate` | Update milestone in draft contract |
+| `DELETE` | `/api/contracts/:id/milestones/:milestoneId` | `freelancer` (owner) | `authenticate`, `loadContract`, `loadMilestone` | Delete milestone and renumber orders |
+| `POST` | `/api/contracts/:id/milestones/:milestoneId/start` | `freelancer` (owner) | `authenticate`, `loadContract`, `loadMilestone` | Start milestone work |
+| `POST` | `/api/contracts/:id/milestones/:milestoneId/submit` | `freelancer` (owner) | `authenticate`, `loadContract`, `loadMilestone`, `validate` | Submit deliverable for review |
+| `POST` | `/api/contracts/:id/milestones/:milestoneId/approve` | `client` (target) | `authenticate`, `loadContract`, `loadMilestone` | Approve submitted milestone |
+| `POST` | `/api/contracts/:id/milestones/:milestoneId/request-revision` | `client` (target) | `authenticate`, `loadContract`, `loadMilestone`, `validate` | Request revisions on milestone |
+| `POST` | `/api/contracts/:id/milestones/:milestoneId/mark-paid` | `client` (target) | `authenticate`, `loadContract`, `loadMilestone`, `validate` | Mark milestone as paid |
+
+---
+
+### 1. Create Milestone
+
+Creates a new milestone in `"pending"` status with `order = last + 1`. Allowed only for the owning freelancer while contract is in `"draft"`.
+
+- **Method**: `POST`
+- **URL**: `/api/contracts/:id/milestones`
+- **Headers**:
+  - `Content-Type: application/json`
+  - `Authorization: Bearer <freelancer_access_token>`
+- **Request Body**:
+```json
+{
+  "title": "Milestone 1: Wireframes & High-Fidelity UI",
+  "description": "Figma design system, interactive prototypes, and design approval",
+  "amount": 25000,
+  "dueDate": "2026-11-10T18:00:00.000Z"
+}
+```
+- **Success Response (`201 Created`)**:
+```json
+{
+  "success": true,
+  "data": {
+    "_id": "6708001abc456def78900001",
+    "contract": "6707123abc456def78901234",
+    "title": "Milestone 1: Wireframes & High-Fidelity UI",
+    "description": "Figma design system, interactive prototypes, and design approval",
+    "amount": 25000,
+    "dueDate": "2026-11-10T18:00:00.000Z",
+    "order": 1,
+    "status": "pending",
+    "revisionNotes": null,
+    "submissionNote": null,
+    "paymentReference": null,
+    "createdAt": "2026-10-12T12:00:00.000Z",
+    "updatedAt": "2026-10-12T12:00:00.000Z"
+  }
+}
+```
+- **Error Responses**:
+  - `400 Bad Request`: Validation failure or amount exceeds remaining contract balance.
+  - `403 Forbidden`: Authenticated user is not the contract freelancer.
+  - `409 Conflict`: Contract is not in `draft` status.
+
+---
+
+### 2. List Milestones
+
+Retrieves all milestones for a contract sorted in ascending order (`order: 1`).
+
+- **Method**: `GET`
+- **URL**: `/api/contracts/:id/milestones`
+- **Headers**: `Authorization: Bearer <access_token>`
+- **Success Response (`200 OK`)**:
+```json
+{
+  "success": true,
+  "data": [
+    {
+      "_id": "6708001abc456def78900001",
+      "contract": "6707123abc456def78901234",
+      "title": "Milestone 1: Wireframes & High-Fidelity UI",
+      "amount": 25000,
+      "dueDate": "2026-11-10T18:00:00.000Z",
+      "order": 1,
+      "status": "pending"
+    }
+  ]
+}
+```
+
+---
+
+### 3. Reorder Milestones
+
+Reorders milestones by accepting an array containing exactly all milestone IDs of the contract.
+
+- **Method**: `PUT`
+- **URL**: `/api/contracts/:id/milestones/reorder`
+- **Headers**:
+  - `Content-Type: application/json`
+  - `Authorization: Bearer <freelancer_access_token>`
+- **Request Body**:
+```json
+{
+  "order": [
+    "6708002abc456def78900002",
+    "6708001abc456def78900001",
+    "6708003abc456def78900003"
+  ]
+}
+```
+- **Success Response (`200 OK`)**:
+```json
+{
+  "success": true,
+  "data": [
+    { "_id": "6708002abc456def78900002", "order": 1, "title": "Milestone 2" },
+    { "_id": "6708001abc456def78900001", "order": 2, "title": "Milestone 1" },
+    { "_id": "6708003abc456def78900003", "order": 3, "title": "Milestone 3" }
+  ]
+}
+```
+- **Error Responses**:
+  - `400 Bad Request`: Array count does not match, contains duplicates, or contains unknown IDs.
+  - `409 Conflict`: Contract status is not `draft`.
+
+---
+
+### 4. Update Milestone
+
+Updates milestone fields in a draft contract.
+
+- **Method**: `PATCH`
+- **URL**: `/api/contracts/:id/milestones/:milestoneId`
+- **Headers**:
+  - `Content-Type: application/json`
+  - `Authorization: Bearer <freelancer_access_token>`
+- **Request Body** *(all fields optional)*:
+```json
+{
+  "title": "Milestone 1: Updated Scope",
+  "amount": 30000
+}
+```
+- **Success Response (`200 OK`)**:
+```json
+{
+  "success": true,
+  "data": {
+    "_id": "6708001abc456def78900001",
+    "title": "Milestone 1: Updated Scope",
+    "amount": 30000,
+    "order": 1,
+    "status": "pending"
+  }
+}
+```
+
+---
+
+### 5. Delete Milestone
+
+Deletes a milestone and automatically renumbers remaining milestones (`1, 2, 3...`).
+
+- **Method**: `DELETE`
+- **URL**: `/api/contracts/:id/milestones/:milestoneId`
+- **Headers**: `Authorization: Bearer <freelancer_access_token>`
+- **Success Response (`200 OK`)**:
+```json
+{
+  "success": true,
+  "message": "Milestone deleted successfully"
+}
+```
+
+---
+
+### 6. Start Milestone
+
+Transitions milestone from `pending` (or `revision_requested`) to `in_progress`. Enforces the sequential rule (earlier milestones must be `approved` or `paid`) and clears `revisionNotes`.
+
+- **Method**: `POST`
+- **URL**: `/api/contracts/:id/milestones/:milestoneId/start`
+- **Headers**: `Authorization: Bearer <freelancer_access_token>`
+- **Request Body**: None
+- **Success Response (`200 OK`)**:
+```json
+{
+  "success": true,
+  "data": {
+    "_id": "6708001abc456def78900001",
+    "status": "in_progress",
+    "startedAt": "2026-10-12T12:30:00.000Z",
+    "revisionNotes": null
+  }
+}
+```
+- **Error Responses**:
+  - `403 Forbidden`: Caller is not the contract freelancer.
+  - `409 Conflict`: Contract is not active, milestone status does not permit start, or earlier milestone is incomplete.
+
+---
+
+### 7. Submit Milestone Deliverable
+
+Transitions milestone from `in_progress` to `submitted`.
+
+- **Method**: `POST`
+- **URL**: `/api/contracts/:id/milestones/:milestoneId/submit`
+- **Headers**:
+  - `Content-Type: application/json`
+  - `Authorization: Bearer <freelancer_access_token>`
+- **Request Body**:
+```json
+{
+  "submissionNote": "Designs published to Figma link: https://figma.com/file/xyz"
+}
+```
+- **Success Response (`200 OK`)**:
+```json
+{
+  "success": true,
+  "data": {
+    "_id": "6708001abc456def78900001",
+    "status": "submitted",
+    "submittedAt": "2026-10-12T13:00:00.000Z",
+    "submissionNote": "Designs published to Figma link: https://figma.com/file/xyz"
+  }
+}
+```
+
+---
+
+### 8. Approve Milestone
+
+Transitions milestone from `submitted` to `approved`.
+
+- **Method**: `POST`
+- **URL**: `/api/contracts/:id/milestones/:milestoneId/approve`
+- **Headers**: `Authorization: Bearer <client_access_token>`
+- **Request Body**: None
+- **Success Response (`200 OK`)**:
+```json
+{
+  "success": true,
+  "data": {
+    "_id": "6708001abc456def78900001",
+    "status": "approved",
+    "approvedAt": "2026-10-12T13:15:00.000Z"
+  }
+}
+```
+- **Error Responses**:
+  - `403 Forbidden`: Caller is not the contract client.
+  - `409 Conflict`: Milestone is not in `submitted` status.
+
+---
+
+### 9. Request Milestone Revision
+
+Transitions milestone from `submitted` to `revision_requested`. Requires detailed notes (minimum 5 characters).
+
+- **Method**: `POST`
+- **URL**: `/api/contracts/:id/milestones/:milestoneId/request-revision`
+- **Headers**:
+  - `Content-Type: application/json`
+  - `Authorization: Bearer <client_access_token>`
+- **Request Body**:
+```json
+{
+  "revisionNotes": "Please improve contrast on mobile headers and add user profile dropdown states."
+}
+```
+- **Success Response (`200 OK`)**:
+```json
+{
+  "success": true,
+  "data": {
+    "_id": "6708001abc456def78900001",
+    "status": "revision_requested",
+    "revisionNotes": "Please improve contrast on mobile headers and add user profile dropdown states."
+  }
+}
+```
+
+---
+
+### 10. Mark Milestone as Paid
+
+Transitions milestone from `approved` to `paid`. If every milestone in the contract is now paid, automatically updates the contract status to `"completed"` with `completedAt` timestamp.
+
+- **Method**: `POST`
+- **URL**: `/api/contracts/:id/milestones/:milestoneId/mark-paid`
+- **Headers**:
+  - `Content-Type: application/json`
+  - `Authorization: Bearer <client_access_token>`
+- **Request Body** *(optional)*:
+```json
+{
+  "paymentReference": "UPI-REF-9876543210"
+}
+```
+- **Success Response (`200 OK`)**:
+```json
+{
+  "success": true,
+  "data": {
+    "_id": "6708001abc456def78900001",
+    "status": "paid",
+    "paidAt": "2026-10-12T13:30:00.000Z",
+    "paymentReference": "UPI-REF-9876543210"
+  }
+}
+```
