@@ -1041,3 +1041,131 @@ Transitions milestone from `approved` to `paid`. If every milestone in the contr
   }
 }
 ```
+
+---
+
+## Submissions API
+
+Deliverables (uploaded files or external links) are attached to milestones via the Submissions API.
+
+All routes are mounted under `/api/contracts/:id/milestones/:milestoneId/submissions`.
+All routes require `Authorization: Bearer <access_token>`.
+
+> [!NOTE]
+> **Storage note**: Files are stored in Cloudinary with randomly generated, unguessable public IDs. However, the URLs themselves are **not access-controlled** — anyone who knows the URL can access the file. Signed/private URLs are a planned future improvement.
+
+### Environment Variables (Cloudinary)
+
+Add these to your `.env` to enable file uploads. They are **optional** — the server boots without them and returns `503` for file-upload requests while link submissions continue to work.
+
+```env
+CLOUDINARY_CLOUD_NAME=your_cloud_name_here
+CLOUDINARY_API_KEY=your_api_key_here
+CLOUDINARY_API_SECRET=your_api_secret_here
+```
+
+### Allowed File Types
+
+| Extension | MIME type |
+|-----------|-----------|
+| `.pdf` | `application/pdf` |
+| `.png` | `image/png` |
+| `.jpg` / `.jpeg` | `image/jpeg` |
+| `.webp` | `image/webp` |
+| `.zip` | `application/zip` |
+| `.doc` | `application/msword` |
+| `.docx` | `application/vnd.openxmlformats-officedocument.wordprocessingml.document` |
+| `.txt` | `text/plain` |
+| `.md` | `text/markdown` |
+
+**Maximum file size**: 10 MB. Exceeding this returns `413`.
+
+### 1. Add a Submission (Freelancer only)
+
+- **Method**: `POST`
+- **URL**: `/api/contracts/:id/milestones/:milestoneId/submissions`
+- **Content-Type**: `multipart/form-data` (for file uploads) or `application/json` / `multipart/form-data` (for links)
+- **Multipart field name**: `file`
+- **Text fields**: `linkUrl` (optional), `note` (optional, max 500 chars)
+- **Rules**: Exactly one of `file` or `linkUrl` must be provided (not both, not neither).
+
+**File upload example (multipart/form-data)**:
+
+| Field | Value |
+|-------|-------|
+| `file` | *(attach PDF or other allowed file, max 10 MB)* |
+| `note` | `"First draft"` *(optional)* |
+
+**Link submission example (multipart/form-data or JSON)**:
+
+```json
+{
+  "linkUrl": "https://figma.com/file/abc123/Design-v1",
+  "note": "Figma prototype link"
+}
+```
+
+- **Success Response (`201 Created`)**:
+```json
+{
+  "success": true,
+  "data": {
+    "_id": "...",
+    "type": "file",
+    "fileUrl": "https://res.cloudinary.com/your-cloud/...",
+    "originalName": "report.pdf",
+    "mimeType": "application/pdf",
+    "size": 204800,
+    "revisionRound": 1,
+    "submittedBy": "...",
+    "createdAt": "2026-10-14T12:00:00.000Z"
+  }
+}
+```
+
+- **Error Responses**:
+  - `400`: No file or link provided / both provided / invalid URL scheme (`javascript:` etc.) / unsupported file type.
+  - `403`: Caller is not the contract freelancer.
+  - `409`: Contract not active / milestone not `in_progress` / max 10 submissions per round exceeded.
+  - `413`: File exceeds 10 MB.
+  - `503`: Cloudinary not configured (file-only; links still work).
+
+---
+
+### 2. List Submissions (Any participant)
+
+- **Method**: `GET`
+- **URL**: `/api/contracts/:id/milestones/:milestoneId/submissions`
+
+- **Success Response (`200 OK`)**:
+```json
+{
+  "success": true,
+  "data": [ ... ],
+  "grouped": {
+    "1": [ ... ],
+    "2": [ ... ]
+  }
+}
+```
+
+Results are newest-first; `grouped` organises them by `revisionRound`.
+
+---
+
+### 3. Delete a Submission (Freelancer who uploaded it)
+
+- **Method**: `DELETE`
+- **URL**: `/api/contracts/:id/milestones/:milestoneId/submissions/:submissionId`
+
+Allowed only while the milestone is `in_progress` and only for submissions belonging to the **current** revision round. Deleting a file submission also removes the asset from Cloudinary.
+
+- **Success Response (`200 OK`)**:
+```json
+{ "success": true, "message": "Submission deleted successfully" }
+```
+
+- **Error Responses**:
+  - `403`: Not the uploader.
+  - `404`: Submission not found.
+  - `409`: Milestone not in `in_progress` status, or submission belongs to a previous revision round.

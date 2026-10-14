@@ -2,6 +2,7 @@ import mongoose from 'mongoose';
 import { ApiError } from '../utils/ApiError.js';
 import { asyncHandler } from '../utils/asyncHandler.js';
 import { Milestone } from '../models/Milestone.js';
+import { Submission } from '../models/Submission.js';
 import { assertMilestoneTransition } from '../utils/milestoneStateMachine.js';
 import { checkAndCompleteContract } from '../services/contractCompletion.js';
 
@@ -85,9 +86,21 @@ export const createMilestone = asyncHandler(async (req, res) => {
 export const listMilestones = asyncHandler(async (req, res) => {
   const milestones = await Milestone.find({ contract: req.contract._id }).sort({ order: 1 });
 
+  // Attach current-round submissionCount to each milestone
+  const milestonesWithCount = await Promise.all(
+    milestones.map(async (m) => {
+      const currentRound = (m.revisionCount ?? 0) + 1;
+      const submissionCount = await Submission.countDocuments({
+        milestone: m._id,
+        revisionRound: currentRound,
+      });
+      return { ...m.toObject(), submissionCount };
+    })
+  );
+
   res.status(200).json({
     success: true,
-    data: milestones,
+    data: milestonesWithCount,
   });
 });
 
@@ -297,7 +310,15 @@ export const submitMilestone = asyncHandler(async (req, res) => {
   const userRole = getParticipantRole(req.contract, req.user);
   assertMilestoneTransition(req.milestone, 'submit', userRole);
 
-  // TODO Phase 5: require at least one submission (file or link)
+  // Require at least one submission in the current revision round
+  const currentRound = (req.milestone.revisionCount ?? 0) + 1;
+  const submissionCount = await Submission.countDocuments({
+    milestone: req.milestone._id,
+    revisionRound: currentRound,
+  });
+  if (submissionCount === 0) {
+    throw new ApiError(400, 'Add at least one file or link before submitting');
+  }
 
   const updateFields = {
     status: 'submitted',
@@ -333,6 +354,7 @@ export const submitMilestone = asyncHandler(async (req, res) => {
   res.status(200).json({
     success: true,
     data: updatedMilestone,
+    submissionCount,
   });
 });
 
@@ -393,6 +415,7 @@ export const requestRevisionMilestone = asyncHandler(async (req, res) => {
   assertMilestoneTransition(req.milestone, 'request-revision', userRole);
 
   // Atomic update: filter includes expected current status ('submitted')
+  // Also atomically increments revisionCount to track revision rounds
   const updatedMilestone = await Milestone.findOneAndUpdate(
     {
       _id: req.milestone._id,
@@ -404,6 +427,7 @@ export const requestRevisionMilestone = asyncHandler(async (req, res) => {
         status: 'revision_requested',
         revisionNotes: req.body.revisionNotes,
       },
+      $inc: { revisionCount: 1 },
     },
     { new: true }
   );

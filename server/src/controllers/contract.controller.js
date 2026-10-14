@@ -2,6 +2,7 @@ import { ApiError } from '../utils/ApiError.js';
 import { asyncHandler } from '../utils/asyncHandler.js';
 import { Contract } from '../models/Contract.js';
 import { Milestone } from '../models/Milestone.js';
+import { Submission } from '../models/Submission.js';
 import { User } from '../models/User.js';
 import { assertTransition } from '../utils/contractStateMachine.js';
 
@@ -112,6 +113,18 @@ export const getContract = asyncHandler(async (req, res) => {
 
   const milestones = await Milestone.find({ contract: req.contract._id }).sort({ order: 1 });
 
+  // Attach current-round submissionCount to each milestone
+  const milestonesWithCount = await Promise.all(
+    milestones.map(async (m) => {
+      const currentRound = (m.revisionCount ?? 0) + 1;
+      const submissionCount = await Submission.countDocuments({
+        milestone: m._id,
+        revisionRound: currentRound,
+      });
+      return { ...m.toObject(), submissionCount };
+    })
+  );
+
   const total = milestones.length;
   const approved = milestones.filter((m) => m.status === 'approved').length;
   const paid = milestones.filter((m) => m.status === 'paid').length;
@@ -127,7 +140,7 @@ export const getContract = asyncHandler(async (req, res) => {
 
   const contractData = {
     ...contract.toObject(),
-    milestones,
+    milestones: milestonesWithCount,
     progress,
   };
 

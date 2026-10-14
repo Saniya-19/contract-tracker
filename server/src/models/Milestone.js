@@ -50,6 +50,11 @@ const milestoneSchema = new mongoose.Schema(
       maxlength: [1000, 'Revision notes cannot exceed 1000 characters'],
       default: null,
     },
+    revisionCount: {
+      type: Number,
+      default: 0,
+      min: [0, 'Revision count cannot be negative'],
+    },
     submissionNote: {
       type: String,
       trim: true,
